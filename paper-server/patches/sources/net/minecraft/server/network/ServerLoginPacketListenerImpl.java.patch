@@ -213,7 +213,7 @@
                  }
              }
  
-@@ -225,18 +_,123 @@
+@@ -225,18 +_,206 @@
                      ? ((InetSocketAddress)remoteAddress).getAddress()
                      : null;
              }
@@ -297,43 +297,126 @@
 +            }
 +
 +            net.minecraft.network.FriendlyByteBuf buf = payload.buffer;
-+            if (!com.destroystokyo.paper.proxy.VelocityProxy.checkIntegrity(buf)) {
-+                this.disconnect("Unable to verify player details");
++
++            // Paper start - Support multiple velocity secrets via API
++            // Get the proxy's IP BEFORE it gets overwritten with the forwarded player IP
++            String proxyIp = null;
++            java.net.SocketAddress proxyAddr = this.connection.getRemoteAddress();
++            if (proxyAddr instanceof java.net.InetSocketAddress inetAddr) {
++                proxyIp = inetAddr.getAddress().getHostAddress();
++            }
++
++            String staticSecret = io.papermc.paper.configuration.GlobalConfiguration.get().proxies.velocity.secret;
++            String adminKey = io.papermc.paper.configuration.GlobalConfiguration.get().proxies.velocity.adminKey;
++
++            // Mark buffer position to allow retry with different secret
++            buf.markReaderIndex();
++            boolean verified = false;
++
++            // Try static secret first if configured (fast path, no blocking)
++            if (!staticSecret.isEmpty()) {
++                verified = com.destroystokyo.paper.proxy.VelocityProxy.checkIntegrity(buf, staticSecret);
++            }
++
++            // If static secret worked, continue synchronously
++            if (verified) {
++                this.processVelocityLogin(buf);
 +                return;
 +            }
 +
-+            int version = buf.readVarInt();
-+            if (version > com.destroystokyo.paper.proxy.VelocityProxy.MAX_SUPPORTED_FORWARDING_VERSION) {
-+                throw new IllegalStateException("Unsupported forwarding version " + version + ", wanted upto " + com.destroystokyo.paper.proxy.VelocityProxy.MAX_SUPPORTED_FORWARDING_VERSION);
++            // If static secret failed, try API lookup asynchronously to avoid blocking Netty thread
++            if (!adminKey.isEmpty() && proxyIp != null) {
++                buf.resetReaderIndex();
++                // Copy buffer data for async use since original buffer will be released
++                byte[] bufferData = new byte[buf.readableBytes()];
++                buf.getBytes(buf.readerIndex(), bufferData);
++                final String finalProxyIp = proxyIp;
++                final int originalPort = proxyAddr instanceof java.net.InetSocketAddress ? ((java.net.InetSocketAddress) proxyAddr).getPort() : 0;
++
++                authenticatorPool.execute(() -> {
++                    try {
++                        String apiSecret = com.destroystokyo.paper.proxy.VelocityProxy.fetchSecretForIp(adminKey, finalProxyIp);
++                        if (apiSecret != null && !apiSecret.isEmpty()) {
++                            net.minecraft.network.FriendlyByteBuf asyncBuf = new net.minecraft.network.FriendlyByteBuf(io.netty.buffer.Unpooled.wrappedBuffer(bufferData));
++                            try {
++                                boolean apiVerified = com.destroystokyo.paper.proxy.VelocityProxy.checkIntegrity(asyncBuf, apiSecret);
++                                if (apiVerified) {
++                                    this.processVelocityLoginAsync(asyncBuf, originalPort);
++                                    return;
++                                }
++                            } finally {
++                                asyncBuf.release();
++                            }
++                        }
++                        LOGGER.warn("Velocity verification failed for proxy IP: {}", finalProxyIp);
++                        this.disconnect("Unable to verify player details");
++                    } catch (Exception ex) {
++                        LOGGER.error("Exception during velocity verification for IP {}", finalProxyIp, ex);
++                        this.disconnect("Unable to verify player details");
++                    }
++                });
++                return;
 +            }
 +
-+            java.net.SocketAddress listening = this.connection.getRemoteAddress();
-+            int port = 0;
-+            if (listening instanceof java.net.InetSocketAddress) {
-+                port = ((java.net.InetSocketAddress) listening).getPort();
-+            }
-+            this.connection.address = new java.net.InetSocketAddress(com.destroystokyo.paper.proxy.VelocityProxy.readAddress(buf), port);
-+
-+            this.authenticatedProfile = com.destroystokyo.paper.proxy.VelocityProxy.createProfile(buf);
-+
-+            //TODO Update handling for lazy sessions, might not even have to do anything?
-+
-+            // Proceed with login
-+            authenticatorPool.execute(() -> {
-+                try {
-+                    final GameProfile gameprofile = this.callPlayerPreLoginEvents(this.authenticatedProfile);
-+                    ServerLoginPacketListenerImpl.LOGGER.info("UUID of player {} is {}", gameprofile.name(), gameprofile.id());
-+                    ServerLoginPacketListenerImpl.this.startClientVerification(gameprofile);
-+                } catch (Exception ex) {
-+                    disconnect("Failed to verify username!");
-+                    server.server.getLogger().log(java.util.logging.Level.WARNING, "Exception verifying " + this.authenticatedProfile.name(), ex);
-+                }
-+            });
++            LOGGER.warn("Velocity verification failed for proxy IP: {} (no valid secret configured)", proxyIp);
++            this.disconnect("Unable to verify player details");
++            // Paper end - Support multiple velocity secrets via API
 +            return;
 +        }
 +        // Paper end - Add Velocity IP Forwarding Support
          this.disconnect(ServerCommonPacketListenerImpl.DISCONNECT_UNEXPECTED_QUERY);
      }
++
++    // Paper start - Support multiple velocity secrets via API
++    private void processVelocityLogin(net.minecraft.network.FriendlyByteBuf buf) {
++        int version = buf.readVarInt();
++        if (version > com.destroystokyo.paper.proxy.VelocityProxy.MAX_SUPPORTED_FORWARDING_VERSION) {
++            throw new IllegalStateException("Unsupported forwarding version " + version + ", wanted upto " + com.destroystokyo.paper.proxy.VelocityProxy.MAX_SUPPORTED_FORWARDING_VERSION);
++        }
++
++        java.net.SocketAddress listening = this.connection.getRemoteAddress();
++        int port = 0;
++        if (listening instanceof java.net.InetSocketAddress) {
++            port = ((java.net.InetSocketAddress) listening).getPort();
++        }
++        this.connection.address = new java.net.InetSocketAddress(com.destroystokyo.paper.proxy.VelocityProxy.readAddress(buf), port);
++
++        this.authenticatedProfile = com.destroystokyo.paper.proxy.VelocityProxy.createProfile(buf);
++
++        // Proceed with login
++        authenticatorPool.execute(() -> {
++            try {
++                final GameProfile gameprofile = this.callPlayerPreLoginEvents(this.authenticatedProfile);
++                ServerLoginPacketListenerImpl.LOGGER.info("UUID of player {} is {}", gameprofile.name(), gameprofile.id());
++                ServerLoginPacketListenerImpl.this.startClientVerification(gameprofile);
++            } catch (Exception ex) {
++                disconnect("Failed to verify username!");
++                server.server.getLogger().log(java.util.logging.Level.WARNING, "Exception verifying " + this.authenticatedProfile.name(), ex);
++            }
++        });
++    }
++
++    private void processVelocityLoginAsync(net.minecraft.network.FriendlyByteBuf buf, int originalPort) {
++        int version = buf.readVarInt();
++        if (version > com.destroystokyo.paper.proxy.VelocityProxy.MAX_SUPPORTED_FORWARDING_VERSION) {
++            throw new IllegalStateException("Unsupported forwarding version " + version + ", wanted upto " + com.destroystokyo.paper.proxy.VelocityProxy.MAX_SUPPORTED_FORWARDING_VERSION);
++        }
++
++        this.connection.address = new java.net.InetSocketAddress(com.destroystokyo.paper.proxy.VelocityProxy.readAddress(buf), originalPort);
++
++        this.authenticatedProfile = com.destroystokyo.paper.proxy.VelocityProxy.createProfile(buf);
++
++        // Already in authenticatorPool, continue directly
++        try {
++            final GameProfile gameprofile = this.callPlayerPreLoginEvents(this.authenticatedProfile);
++            ServerLoginPacketListenerImpl.LOGGER.info("UUID of player {} is {}", gameprofile.name(), gameprofile.id());
++            ServerLoginPacketListenerImpl.this.startClientVerification(gameprofile);
++        } catch (Exception ex) {
++            disconnect("Failed to verify username!");
++            server.server.getLogger().log(java.util.logging.Level.WARNING, "Exception verifying " + this.authenticatedProfile.name(), ex);
++        }
++    }
++    // Paper end - Support multiple velocity secrets via API
  
      @Override
      public void handleLoginAcknowledgement(ServerboundLoginAcknowledgedPacket packet) {
